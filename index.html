@@ -180,6 +180,10 @@
   <input type="file" id="fileInput" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
   <div id="loadStatus" class="msg"></div>
 
+  <label for="pairFileInput" style="margin-top: 16px">Файл связок игрок–секундант (необязательно)</label>
+  <input type="file" id="pairFileInput" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+  <div id="pairStatus" class="msg"></div>
+
   <label for="sitFileInput" style="margin-top: 16px">Файл ситуаций (.docx или .pdf)</label>
   <input type="file" id="sitFileInput" accept=".docx,.pdf,.doc,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword">
   <div id="sitFileStatus" class="msg"></div>
@@ -501,6 +505,8 @@ const MIN_VARIANT_DIFF = 2;     // минимум людей с другим м�
 // ============================================================
 const STATE = {
   group: null,
+  sheets: null,           // листы группы из последней загрузки xlsx
+  pairRaw: null,          // связки из файла связок (не хранятся в браузере)
   overrides: {},          // {ник в нижнем регистре: true - выбыл, false - активен}
   confirmed: new Set(),
   wishes: [],
@@ -1081,7 +1087,8 @@ $('fileInput').addEventListener('change', async (e) => {
       setMsg('loadStatus', `В файле нет листов «${GROUP_ID}» и «Поединки ${GROUP_ID}».`, 'err');
       return;
     }
-    STATE.group = parseGroup(dash, sched);
+    STATE.sheets = { dash, sched };
+    rebuildGroup();
     STATE.variants = [];
     STATE.swapSel = null;
     $('resultsCard').style.display = 'none';
@@ -1122,6 +1129,42 @@ function isRedFill(cellObj) {
     if (r >= 200 && g <= 80 && b <= 80) return true;
   }
   return false;
+}
+
+// Дата занятия по частям: {d, m, y} (y = null, если год в заголовке не указан)
+function extractSessionDateParts(text) {
+  let m = text.match(/(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?/);
+  if (m) return { d: +m[1], m: +m[2], y: m[3] ? (m[3].length === 2 ? 2000 + +m[3] : +m[3]) : null };
+  m = text.match(/(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)(?:\s+(\d{4}))?/i);
+  if (m) return { d: +m[1], m: MONTHS[m[2].toLowerCase()], y: m[3] ? +m[3] : null };
+  return null;
+}
+
+// Год для занятий без года: занятия идут по порядку, год восстанавливается
+// от занятий с указанным годом (месяц уменьшился - начался следующий год).
+function inferSessionYears(sessions) {
+  const withParts = sessions.filter(s => s.parts);
+  if (!withParts.length) return;
+  let anchor = withParts.findIndex(s => s.parts.y);
+  if (anchor < 0) {
+    // года нет нигде: последнее занятие - в текущем году или прошлом
+    const now = new Date();
+    const last = withParts[withParts.length - 1];
+    last.parts.yInferred = (last.parts.m > now.getMonth() + 1) ? now.getFullYear() - 1 : now.getFullYear();
+    anchor = withParts.length - 1;
+  }
+  const yearOf = (s) => s.parts.y || s.parts.yInferred;
+  for (let i = anchor - 1; i >= 0; i--) {
+    const next = withParts[i + 1], cur = withParts[i];
+    if (cur.parts.y) continue;
+    cur.parts.yInferred = cur.parts.m > next.parts.m ? yearOf(next) - 1 : yearOf(next);
+  }
+  for (let i = anchor + 1; i < withParts.length; i++) {
+    const prev = withParts[i - 1], cur = withParts[i];
+    if (cur.parts.y) continue;
+    cur.parts.yInferred = cur.parts.m < prev.parts.m ? yearOf(prev) + 1 : yearOf(prev);
+  }
+  for (const s of withParts) s.time = Date.UTC(yearOf(s), s.parts.m - 1, s.parts.d);
 }
 
 const MONTHS = { 'января': 1, 'февраля': 2, 'марта': 3, 'апреля': 4, 'мая': 5, 'июня': 6, 'июля': 7, 'августа': 8, 'сентября': 9, 'октября': 10, 'ноября': 11, 'декабря': 12 };
@@ -1202,6 +1245,7 @@ function parseGroup(dashboardSheet, scheduleSheet) {
   let currentSession = null;
   let sessionIdx = -1;
   const scheduleOnly = new Set();
+  const scheduleTeams = [];         // все связки игрок-секундант расписания (для сверки с файлом связок)
   let sawSituationRow = false;
 
   const addInter = (a, b, ev) => {
@@ -1218,7 +1262,7 @@ function parseGroup(dashboardSheet, scheduleSheet) {
       || (c.indexOf('поединк') !== -1 && !/^Ситуация\s+\d/.test(c));
     if (isHeader) {
       sessionIdx++;
-      currentSession = { idx: sessionIdx, title: c.split('\n')[0], date: extractSessionDate(c), rows: [] };
+      currentSession = { idx: sessionIdx, title: c.split('\n')[0], date: extractSessionDate(c), parts: extractSessionDateParts(c), rows: [] };
       sessions.push(currentSession);
       continue;
     }
@@ -1245,6 +1289,10 @@ function parseGroup(dashboardSheet, scheduleSheet) {
         second: team.second ? byName[team.second.toLowerCase()] || null : null
       };
     });
+
+    for (const team of [team1, team2]) {
+      if (team && team.player && team.second) scheduleTeams.push({ player: lc(team.player), second: lc(team.second), sessionIdx: sIdx });
+    }
 
     // Внутренние связки команды
     for (const t of resolved) {
@@ -1297,20 +1345,165 @@ function parseGroup(dashboardSheet, scheduleSheet) {
     if (totalSessions <= 1) return 1.0;
     return 0.3 + 0.7 * (idx / (totalSessions - 1));
   };
-  // вес взаимодействий пары с учетом давности
-  const interWeight = new Map();
-  for (const [k, evs] of interactions) {
-    let w = 0;
-    for (const e of evs) w += recency(e.sessionIdx);
-    interWeight.set(k, w);
-  }
+  inferSessionYears(sessions);
 
-  return {
-    participants, byName, sessions, totalSessions, recency, historyRows, interactions, interWeight,
+  const group = {
+    participants, byName, sessions, totalSessions, recency, historyRows, interactions, interWeight: new Map(),
+    scheduleTeams, addInter,
     headerWarning: sawSituationRow && sessions.length === 0,
     scheduleOnly: Array.from(scheduleOnly)
   };
+  computeInterWeight(group);
+  return group;
 }
+
+// вес взаимодействий пары с учетом давности
+function computeInterWeight(group) {
+  group.interWeight = new Map();
+  for (const [k, evs] of group.interactions) {
+    let w = 0;
+    for (const e of evs) w += group.recency(e.sessionIdx);
+    group.interWeight.set(k, w);
+  }
+}
+
+// ============================================================
+// ФАЙЛ СВЯЗОК ИГРОК-СЕКУНДАНТ (пункт 6.6)
+// Строка 2 - ники секундантов с колонки C, колонка B - ники игроков с строки 3,
+// в ячейке - дата занятия (одна или несколько).
+// ============================================================
+function pad2(n) { return String(n).padStart(2, '0'); }
+
+function parsePairCellDates(c) {
+  if (!c || c.v === null || c.v === undefined || String(c.v).trim() === '') return [];
+  const out = [];
+  if (c.v instanceof Date) out.push({ d: c.v.getDate(), m: c.v.getMonth() + 1, y: c.v.getFullYear() });
+  else if (typeof c.v === 'number') {
+    const dt = new Date(Math.round((c.v - 25569) * 86400000)); // дата Excel
+    out.push({ d: dt.getUTCDate(), m: dt.getUTCMonth() + 1, y: dt.getUTCFullYear() });
+  } else {
+    const re = /(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?/g;
+    let m;
+    while ((m = re.exec(String(c.v)))) out.push({ d: +m[1], m: +m[2], y: m[3] ? (m[3].length === 2 ? 2000 + +m[3] : +m[3]) : null });
+    if (!out.length) out.push(null); // ячейка заполнена, но дату не разобрать
+  }
+  return out;
+}
+
+function parsePairFile(sheet) {
+  if (!sheet || !sheet['!ref']) throw new UserError('В файле нет данных.');
+  const range = XLSX.utils.decode_range(sheet['!ref']);
+  const secByCol = {};
+  for (let c = 2; c <= range.e.c; c++) {
+    const v = cell(sheet, 1, c);
+    if (typeof v === 'string' && v.trim() && lc(v) !== 'секундант') secByCol[c] = v.trim();
+  }
+  if (!Object.keys(secByCol).length) throw new UserError('Файл не похож на таблицу связок: в строке 2 нет ников секундантов.');
+  const entries = [];
+  for (let r = 2; r <= range.e.r; r++) {
+    const pl = cell(sheet, r, 1);
+    if (typeof pl !== 'string' || !pl.trim() || lc(pl) === 'игрок') continue;
+    for (const c in secByCol) {
+      const cobj = sheet[XLSX.utils.encode_cell({ r, c: +c })];
+      for (const d of parsePairCellDates(cobj)) entries.push({ player: pl.trim(), second: secByCol[c], date: d });
+    }
+  }
+  return entries;
+}
+
+function fmtParts(d) { return d ? pad2(d.d) + '.' + pad2(d.m) + (d.y ? '.' + d.y : '') : 'дата не указана'; }
+
+// Добавляет в группу связки из файла, которых нет в расписании. Возвращает итог для строки статуса.
+function applyPairFile(group, entries) {
+  const res = { total: entries.length, added: [], dup: 0, unknown: [] };
+  const sessByIdx = {};
+  for (const s of group.sessions) sessByIdx[s.idx] = s;
+  const timed = group.sessions.filter(s => s.time !== undefined);
+  const lastTime = timed.length ? Math.max(...timed.map(s => s.time)) : null;
+  const lastIdx = Math.max(0, group.totalSessions - 1);
+
+  for (const e of entries) {
+    const pl = group.byName[lc(e.player)];
+    const sec = group.byName[lc(e.second)];
+    if (!pl || !sec) {
+      for (const n of [e.player, e.second]) if (!group.byName[lc(n)] && !res.unknown.includes(n)) res.unknown.push(n);
+      continue;
+    }
+    // повтор: та же связка в расписании за ту же дату (или у занятия дата не распознана)
+    const isDup = group.scheduleTeams.some(t => {
+      if (t.player !== lc(e.player) || t.second !== lc(e.second)) return false;
+      const s = sessByIdx[t.sessionIdx];
+      if (!s || !s.parts || !e.date) return true;
+      if (s.parts.d !== e.date.d || s.parts.m !== e.date.m) return false;
+      return !(s.parts.y && e.date.y) || s.parts.y === e.date.y;
+    });
+    if (isDup) { res.dup++; continue; }
+
+    // давность: позже последнего занятия - 1.0, иначе как у ближайшего по дате занятия
+    let sIdx = lastIdx;
+    if (e.date && e.date.y && lastTime !== null) {
+      const t = Date.UTC(e.date.y, e.date.m - 1, e.date.d);
+      if (t <= lastTime) {
+        let best = null;
+        for (const s of timed) if (!best || Math.abs(s.time - t) < Math.abs(best.time - t)) best = s;
+        sIdx = best.idx;
+      }
+    }
+    const date = fmtParts(e.date);
+    const ev = { sessionIdx: sIdx, sit: null, fromFile: true, date };
+    pl.playerCount++;
+    sec.secondCount++;
+    pushEvent(pl.wasPlayerWithSecond, sec.nick, ev);
+    pushEvent(sec.wasSecondWithPlayer, pl.nick, ev);
+    group.addInter(pl, sec, { sessionIdx: sIdx, date, kind: 'team', player: pl.nick, second: sec.nick, fromFile: true });
+    res.added.push(`${pl.nick}–${sec.nick} (${date})`);
+  }
+  computeInterWeight(group);
+  return res;
+}
+
+function showPairStatus(res) {
+  if (!res) return;
+  let t = `Файл связок: в файле ${res.total} ${plural(res.total, 'связка', 'связки', 'связок')}, добавлено ${res.added.length}`;
+  t += res.added.length ? ` (нет в расписании): ${res.added.join(', ')}` : '';
+  t += `; пропущено как повторы ${res.dup}.`;
+  if (res.unknown.length) t += ` Пропущены ники вне листа «${GROUP_ID}»: ${res.unknown.join(', ')}.`;
+  setMsg('pairStatus', t, 'ok');
+}
+
+// Пересобирает историю группы из листов и файла связок
+function rebuildGroup() {
+  if (!STATE.sheets) return;
+  STATE.group = parseGroup(STATE.sheets.dash, STATE.sheets.sched);
+  if (STATE.pairRaw) showPairStatus(applyPairFile(STATE.group, STATE.pairRaw));
+}
+
+$('pairFileInput').addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  setMsg('pairStatus', 'Читаю файл связок…');
+  try {
+    const wb = XLSX.read(await file.arrayBuffer(), { type: 'array' });
+    STATE.pairRaw = parsePairFile(wb.Sheets[wb.SheetNames[0]]);
+    if (!STATE.sheets) {
+      setMsg('pairStatus', `Файл связок прочитан (${STATE.pairRaw.length} ${plural(STATE.pairRaw.length, 'связка', 'связки', 'связок')}). Он будет учтён после загрузки таблицы группы.`, 'ok');
+      return;
+    }
+    rebuildGroup();
+    // открытые варианты переводим на обновлённую историю
+    for (const v of STATE.variants) {
+      v.confirmed = v.confirmed.map(p => STATE.group.byName[lc(p.nick)]);
+      v.originalScore = calculateScore(v.original, v.confirmed, STATE.group, v.sits);
+      recomputeVariant(v);
+    }
+    renderAllGroup();
+    if (STATE.variants.length) renderResults();
+  } catch (err) {
+    if (!(err instanceof UserError)) console.error(err);
+    setMsg('pairStatus', (err instanceof UserError ? err.message : 'Ошибка чтения файла связок: ' + err.message), 'err');
+  }
+});
 
 // ============================================================
 // ВЫБЫВШИЕ
@@ -2119,7 +2312,7 @@ function renderResults() {
 }
 
 const INTER_KIND = {
-  team: (e) => `одна команда (${e.player} игрок, ${e.second} секундант)`,
+  team: (e) => `одна команда (${e.player} игрок, ${e.second} секундант)${e.fromFile ? ', из файла связок' : ''}`,
   players: () => 'соперники-игроки',
   cross: (e) => `игрок ${e.player} и секундант соперника ${e.second}`,
   seconds: () => 'секунданты двух команд'
@@ -2138,7 +2331,10 @@ function explainSituation(d) {
     const directN = len(pl.wasPlayerWithSecond[sec.nick]);
     const swapN = len(pl.wasSecondWithPlayer[sec.nick]);
     if (directN && swapN) notes.push(`<span class="bad">🔴 ${e(pl.nick)} + ${e(sec.nick)}: ${directN} раз в той же расстановке, ${swapN} раз в обмене ролями</span>`);
-    else if (directN) notes.push(`<span class="bad">🔴 повтор связки: ${e(pl.nick)} + ${e(sec.nick)} уже была (${directN} раз)</span>`);
+    else if (directN) {
+      const fromFile = pl.wasPlayerWithSecond[sec.nick].filter(x => x.fromFile).map(x => x.date);
+      notes.push(`<span class="bad">🔴 повтор связки: ${e(pl.nick)} + ${e(sec.nick)} уже была (${directN} раз${fromFile.length ? '; из файла связок, ' + e(fromFile.join(', ')) : ''})</span>`);
+    }
     else if (swapN) notes.push(`<span class="warn">🟡 ${e(pl.nick)} и ${e(sec.nick)} уже играли вместе, но в обратных ролях (${swapN} раз) - это обмен ролями</span>`);
   }
 
